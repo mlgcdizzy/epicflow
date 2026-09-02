@@ -1,0 +1,391 @@
+// EpicFlow — Production Prisma schema (PostgreSQL)
+// Models every object defined in the PRD: Epic, Strategic Objective,
+// Team, Dependency, plus supporting auth/RBAC, prioritization scores,
+// roadmap commitments, notifications, and audit history.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-1.0.x", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth (Microsoft Entra ID via NextAuth) + RBAC
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  PORTFOLIO_MANAGER
+  PRODUCT_MANAGER
+  READ_ONLY
+}
+
+model User {
+  id            String    @id @default(cuid())
+  entraId       String?   @unique // Azure AD object id (oid claim)
+  name          String
+  email         String    @unique
+  image         String?
+  role          Role      @default(PRODUCT_MANAGER)
+  productAreas  String[]  @default([]) // areas this PM owns, for scoping
+
+  ownedEpics       Epic[]         @relation("EpicOwner")
+  strategicObj     StrategicObjective[] @relation("ObjectiveExecOwner")
+  savedViews       SavedView[]
+  notifications    Notification[]
+  comments         Comment[]
+  auditEvents      AuditEvent[]
+
+  accounts Account[]
+  sessions Session[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Strategy layer
+// ---------------------------------------------------------------------------
+
+model StrategicObjective {
+  id             String   @id @default(cuid())
+  title          String
+  description    String?
+  executiveOwner User     @relation("ObjectiveExecOwner", fields: [executiveOwnerId], references: [id])
+  executiveOwnerId String
+  startDate      DateTime
+  endDate        DateTime
+  weight         Float    @default(1.0) // relative strategic weighting, 0-1
+
+  pillar   StrategicPillar? @relation(fields: [pillarId], references: [id])
+  pillarId String?
+
+  okrs  OKR[]
+  epics Epic[] @relation("EpicObjective")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model StrategicPillar {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  objectives  StrategicObjective[]
+  epics       Epic[]   @relation("EpicPillar")
+}
+
+model OKR {
+  id          String   @id @default(cuid())
+  objective   StrategicObjective @relation(fields: [objectiveId], references: [id])
+  objectiveId String
+  keyResult   String
+  target      Float
+  current     Float    @default(0)
+  epics       Epic[]   @relation("EpicOKR")
+}
+
+model Theme {
+  id    String @id @default(cuid())
+  name  String @unique
+  epics Epic[]
+}
+
+// ---------------------------------------------------------------------------
+// Delivery layer
+// ---------------------------------------------------------------------------
+
+model Team {
+  id       String @id @default(cuid())
+  name     String @unique
+  manager  String
+  capacity Float  // total points/week available across the team
+  velocity Float  // rolling average points/sprint
+
+  availableEngineers Int @default(0)
+  availablePMs       Int @default(0)
+  designCapacity     Float @default(0)
+  qaCapacity         Float @default(0)
+
+  epics Epic[]
+}
+
+enum EpicStatus {
+  IDEA
+  DISCOVERY
+  VALIDATED
+  PLANNED
+  COMMITTED
+  IN_PROGRESS
+  BLOCKED
+  RELEASED
+  CANCELLED
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TShirtSize {
+  XS
+  S
+  M
+  L
+  XL
+}
+
+model Epic {
+  id            String     @id @default(cuid())
+  epicKey       String     @unique // human-readable id, e.g. EPIC-1042
+  title         String
+  description   String?
+  productArea   String
+  status        EpicStatus @default(IDEA)
+  priorityRank  Int?       // manual override rank within product area
+
+  owner   User?  @relation("EpicOwner", fields: [ownerId], references: [id])
+  ownerId String?
+
+  theme     Theme? @relation(fields: [themeId], references: [id])
+  themeId   String?
+
+  pillar    StrategicPillar? @relation("EpicPillar", fields: [pillarId], references: [id])
+  pillarId  String?
+
+  objective   StrategicObjective? @relation("EpicObjective", fields: [objectiveId], references: [id])
+  objectiveId String?
+
+  okr   OKR?    @relation("EpicOKR", fields: [okrId], references: [id])
+  okrId String?
+
+  team   Team?  @relation(fields: [teamId], references: [id])
+  teamId String?
+
+  targetQuarter String? // e.g. "Q3"
+  targetYear    Int?
+
+  // Prioritization inputs (used across RICE / WSJF / Custom models)
+  reach              Float? // RICE
+  impact             Float? // RICE
+  confidence         Float? // RICE, 0-1
+  effort             Float? // RICE + WSJF job size proxy
+  businessValue       Float? // WSJF + Custom
+  timeCriticality     Float? // WSJF
+  riskReduction       Float? // WSJF
+  jobSize             Float? // WSJF
+  revenueImpact       Float? // Custom
+  customerImpact      Float? // Custom + general field
+  strategicAlignment  Float? // Custom, 1-5, also drives alignment score
+  competitivePressure Float? // Custom
+  riskScore           Float? // Custom, 1-5 (higher = riskier)
+  engineeringComplexity Float? // Custom
+
+  riskLevel   RiskLevel @default(MEDIUM)
+  storyPoints Float?
+  tShirtSize  TShirtSize?
+  expectedDurationWeeks Float?
+
+  // Raw classification signal from imports (e.g. Jira Component / Fix Version)
+  component  String?
+  fixVersion String?
+
+  // Manual/group-assigned position for the Prioritization Matrix
+  matrixValue  Float?
+  matrixEffort Float?
+
+  // Alignment sub-scores (corporateGoal/businessGoal/okr/pillar, 1-5 each) —
+  // stored as JSON since it's a small fixed-shape object, not its own table.
+  alignment Json?
+
+  tags  String[] @default([])
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  scores        PrioritizationScore[]
+  dependenciesOut Dependency[] @relation("SourceEpic")
+  dependenciesIn  Dependency[] @relation("TargetEpic")
+  comments        Comment[]
+  auditEvents     AuditEvent[]
+  savedViewEpics  SavedView[] @relation("SavedViewEpics")
+  integrationLinks IntegrationLink[]
+}
+
+enum ScoringModel {
+  RICE
+  WSJF
+  CUSTOM
+}
+
+model PrioritizationScore {
+  id        String       @id @default(cuid())
+  epic      Epic         @relation(fields: [epicId], references: [id], onDelete: Cascade)
+  epicId    String
+  model     ScoringModel
+  score     Float
+  computedAt DateTime    @default(now())
+
+  @@unique([epicId, model])
+}
+
+enum DependencyType {
+  TECHNICAL
+  BUSINESS
+  COMPLIANCE
+  DATA
+  EXTERNAL_VENDOR
+}
+
+enum DependencyStatus {
+  OPEN
+  AT_RISK
+  RESOLVED
+  BLOCKED
+}
+
+model Dependency {
+  id             String            @id @default(cuid())
+  sourceEpic     Epic              @relation("SourceEpic", fields: [sourceEpicId], references: [id], onDelete: Cascade)
+  sourceEpicId   String
+  targetEpic     Epic              @relation("TargetEpic", fields: [targetEpicId], references: [id], onDelete: Cascade)
+  targetEpicId   String
+  dependencyType DependencyType
+  status         DependencyStatus  @default(OPEN)
+  notes          String?
+  createdAt      DateTime          @default(now())
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  epic      Epic     @relation(fields: [epicId], references: [id], onDelete: Cascade)
+  epicId    String
+  author    User     @relation(fields: [authorId], references: [id])
+  authorId  String
+  body      String
+  createdAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Views, notifications, audit
+// ---------------------------------------------------------------------------
+
+enum ViewVisibility {
+  PERSONAL
+  SHARED
+}
+
+model SavedView {
+  id         String         @id @default(cuid())
+  name       String
+  owner      User           @relation(fields: [ownerId], references: [id])
+  ownerId    String
+  visibility ViewVisibility @default(PERSONAL)
+  filters    Json // serialized filter state: owner, status, area, quarter, pillar, theme, risk, team, priority range
+  epics      Epic[]         @relation("SavedViewEpics")
+  createdAt  DateTime       @default(now())
+}
+
+enum NotificationChannel {
+  EMAIL
+  TEAMS
+  IN_APP
+}
+
+enum NotificationType {
+  EPIC_OVERDUE
+  DEPENDENCY_BLOCKED
+  PRIORITY_CHANGED
+  ROADMAP_SLIP
+  CAPACITY_EXCEEDED
+}
+
+model Notification {
+  id        String              @id @default(cuid())
+  user      User                @relation(fields: [userId], references: [id])
+  userId    String
+  type      NotificationType
+  channel   NotificationChannel @default(IN_APP)
+  message   String
+  read      Boolean             @default(false)
+  createdAt DateTime            @default(now())
+}
+
+model AuditEvent {
+  id        String   @id @default(cuid())
+  epic      Epic?    @relation(fields: [epicId], references: [id], onDelete: SetNull)
+  epicId    String?
+  actor     User     @relation(fields: [actorId], references: [id])
+  actorId   String
+  action    String   // e.g. "status_changed", "score_recalculated"
+  fromValue String?
+  toValue   String?
+  createdAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// External integration sync state (Azure DevOps, Planner, Power BI)
+// ---------------------------------------------------------------------------
+
+enum IntegrationSystem {
+  AZURE_DEVOPS
+  MICROSOFT_PLANNER
+  POWER_BI
+}
+
+model IntegrationLink {
+  id           String            @id @default(cuid())
+  epic         Epic              @relation(fields: [epicId], references: [id], onDelete: Cascade)
+  epicId       String
+  system       IntegrationSystem
+  externalId   String // e.g. Azure DevOps work item id
+  externalUrl  String?
+  lastSyncedAt DateTime?
+  syncStatus   String   @default("pending") // pending | synced | error
+}
+
+// Singleton row (id always "singleton") holding the saved Jira connection details.
+model JiraConnection {
+  id            String    @id @default("singleton")
+  baseUrl       String
+  email         String
+  apiToken      String
+  projectKey    String
+  jql           String?
+  lastSyncedAt  DateTime?
+}
